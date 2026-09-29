@@ -41,6 +41,8 @@ mode, the menu includes downloaded models that are not loaded yet. Models alread
 in memory show `(loaded: instance-id)`. Choose **Exit** to leave without launching
 an agent or changing loaded models.
 
+![Local Agent Launcher showing agent and model selection](StartLocalAgent.png)
+
 **The built-in default address is `http://192.168.1.179:1234/v1`.** This is a
 specific LAN server, not an automatically detected address. Supply `-BaseUrl`
 unless that server is yours. The URL can be the server root or end in `/v1`;
