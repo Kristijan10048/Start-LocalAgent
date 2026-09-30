@@ -9,12 +9,17 @@ Shows a menu of available coding agents, then prompts for model selection.
 .\Start-LocalAgent.ps1 -Client Claude -BaseUrl http://localhost:1234
 
 .EXAMPLE
+.\Start-LocalAgent.ps1 -Client Claude -ServerType LlamaCpp
+Connects to a running llama.cpp server at http://localhost:8080.
+
+.EXAMPLE
 .\Start-LocalAgent.ps1 -ShowVersion
 Displays the current version of the script and exits.
 
 .NOTES
 Claude Code requires an Anthropic-compatible /v1/messages endpoint, such as
-LM Studio 0.4.1 or later. An OpenAI-only server is not sufficient.
+LM Studio 0.4.1 or later or a current llama.cpp server with --jinja enabled.
+An OpenAI-only server is not sufficient.
 #>
 
 param(
@@ -33,7 +38,7 @@ param(
     [switch]$ShowVersion,
 
     # Other compatible servers manage their own model lifecycle.
-    [ValidateSet('LMStudio', 'OpenAICompatible')]
+    [ValidateSet('LMStudio', 'OpenAICompatible', 'LlamaCpp', 'llama.cpp')]
     [string]$ServerType = 'LMStudio'
 )
 
@@ -48,6 +53,13 @@ if ($ShowVersion) {
 if ($Help) {
     Get-Help $MyInvocation.MyCommand -Full
     exit
+}
+
+# Accept the project's spelling as an alias and use its default server port.
+# An explicit BaseUrl always takes precedence, including custom ports/proxies.
+if ($ServerType -eq 'llama.cpp') { $ServerType = 'LlamaCpp' }
+if ($ServerType -eq 'LlamaCpp' -and -not $PSBoundParameters.ContainsKey('BaseUrl')) {
+    $BaseUrl = 'http://localhost:8080/v1'
 }
 
 # -----------------------------------------------------------------------------
@@ -147,15 +159,15 @@ function Get-LMStudioModels([string]$serverUrl, [hashtable]$headers) {
         }
         return $json.models
     } catch {
-        throw "Failed to fetch models from $serverUrl/api/v1/models. Check LM Studio's server, API version, and authentication. For another server, use -ServerType OpenAICompatible. $($_.Exception.Message)"
+        throw "Failed to fetch models from $serverUrl/api/v1/models. Check LM Studio's server, API version, and authentication. For llama.cpp, use -ServerType LlamaCpp; for other servers, use -ServerType OpenAICompatible. $($_.Exception.Message)"
     }
 }
 
 # Identify a well-known local model server from its URL so the agent menu can show
-# which backend each client is pointing at. Detection is by port (LM Studio's default
-# 1234 and Ollama's default 11434), which works regardless of host or -ServerType.
-# Returns a friendly name such as 'LM Studio' / 'Ollama', or $null when unknown.
-function Get-ServerLabel([string]$baseUrl) {
+# which backend each client is pointing at. Explicit llama.cpp mode takes priority;
+# otherwise retain the port hints for LM Studio and Ollama.
+function Get-ServerLabel([string]$baseUrl, [string]$serverType) {
+    if ($serverType -eq 'LlamaCpp') { return 'llama.cpp' }
     if ([string]::IsNullOrWhiteSpace($baseUrl)) { return $null }
     try {
         $uri = [uri]$baseUrl
@@ -245,7 +257,7 @@ function Invoke-Client(
     $config = $ClientConfigs[$Client]
     $clientEnvironment = @{}
 
-    # Both clients must use a confirmed instance before launching, on any host.
+    # LM Studio clients must use a confirmed instance before launching, on any host.
     if ($ServerType -eq 'LMStudio') {
         $selectedModel = Ensure-ModelLoaded -serverUrl $serverUrl -headers $headers -selectedModel $selectedModel
     }
@@ -323,7 +335,7 @@ function Get-ClientCommand([string]$Client) {
 if (-not $PSBoundParameters.ContainsKey('Client')) {
     Write-Host "--- Select a coding agent ---" -ForegroundColor Cyan
     # Identify the backend so each agent line can show which server it points at.
-    $serverLabel = Get-ServerLabel $BaseUrl
+    $serverLabel = Get-ServerLabel -baseUrl $BaseUrl -serverType $ServerType
 
     # Show the server address once above the list so each agent line stays short.
     Write-Host "Server: $BaseUrl" -ForegroundColor DarkGray

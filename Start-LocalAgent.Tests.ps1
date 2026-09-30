@@ -110,7 +110,7 @@ exit $global:ModelLauncherTestExitCode
         $launch.Arguments[0] | Should Be '--model'
         $launch.Arguments[1] | Should Be 'qwen/local-coder'
         $launch.Directory | Should Be $PWD.Path
-        $launch.Environment.ANTHROPIC_BASE_URL | Should Be 'http://192.168.1.179:1234'
+        $launch.Environment.ANTHROPIC_BASE_URL | Should Be 'http://localhost:1234'
         $launch.Environment.ANTHROPIC_AUTH_TOKEN | Should Be 'lmstudio'
         $launch.Environment.ANTHROPIC_API_KEY | Should BeNullOrEmpty
         $launch.Environment.CLAUDE_CODE_OAUTH_TOKEN | Should BeNullOrEmpty
@@ -163,7 +163,7 @@ exit $global:ModelLauncherTestExitCode
     It 'launches explicit Copilot without the agent menu and keeps its server and settings' {
         & $launcherPath -Client Copilot
         $launch = $global:ModelLauncherTestLaunch
-        $launch.Url | Should Be 'http://192.168.1.179:1234/v1'
+        $launch.Url | Should Be 'http://localhost:1234/v1'
         $launch.Model | Should Be 'qwen/local-coder'
         $launch.Provider | Should Be 'openai'
         $launch.Offline | Should Be 'true'
@@ -327,16 +327,14 @@ exit $global:ModelLauncherTestExitCode
         }
     }
 
-    # Confirms a folder that is not on PATH emits exactly one yellow heads-up to add it, and restores the user PATH afterward.
+    # Simulate an absent folder without changing the user's persistent PATH.
     It 'warns in yellow when the script folder is missing from PATH' {
-        $originalPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        try {
-            # A path that cannot contain this repo, so the check must flag it as absent.
-            [Environment]::SetEnvironmentVariable('Path', 'C:\nonexistent-test-path', 'User')
-            & $launcherPath -Client Claude
-            Assert-MockCalled Write-Host -Times 1 -Exactly -Scope It -ParameterFilter { $ForegroundColor -eq 'Yellow' }
-        } finally {
-            [Environment]::SetEnvironmentVariable('Path', $originalPath, 'User')
+        Mock Split-Path { 'C:\nonexistent-test-path' } -ParameterFilter {
+            $Parent -and $Path -eq $launcherPath
+        }
+        & $launcherPath -Client Claude
+        Assert-MockCalled Write-Host -Times 1 -Exactly -Scope It -ParameterFilter {
+            $ForegroundColor -eq 'Yellow' -and $Object -like '*not on the PATH*'
         }
     }
 
@@ -372,11 +370,11 @@ exit $global:ModelLauncherTestExitCode
         $writes = @($global:ModelLauncherTestState.Requests | Where-Object { $_.Method -eq 'Post' })
         $writes.Count | Should Be 4
         for ($i = 0; $i -lt 3; $i++) {
-            $writes[$i].Uri | Should Be 'http://192.168.1.179:1234/api/v1/models/unload'
+            $writes[$i].Uri | Should Be 'http://localhost:1234/api/v1/models/unload'
             $writes[$i].ContentType | Should Be 'application/json'
             ($writes[$i].Body | ConvertFrom-Json).instance_id | Should Be "old-instance-$($i + 1)"
         }
-        $writes[3].Uri | Should Be 'http://192.168.1.179:1234/api/v1/models/load'
+        $writes[3].Uri | Should Be 'http://localhost:1234/api/v1/models/load'
         $global:ModelLauncherTestLaunch.Arguments[1] | Should Be 'qwen/local-coder'
         Assert-MockCalled Write-Host -Times 0 -Exactly -Scope It -ParameterFilter { $Object -like '*embedding-model*' }
     }
@@ -483,5 +481,72 @@ exit $global:ModelLauncherTestExitCode
         $global:ModelLauncherTestState.Request.Uri | Should Be 'http://localhost:11434/v1/models'
         $global:ModelLauncherTestLaunch | Should Not BeNullOrEmpty
         Assert-MockCalled Invoke-RestMethod -Times 1 -Exactly -Scope It
+    }
+
+    It 'uses llama.cpp discovery and preserves model IDs for both clients' -TestCases @(
+        @{ Client = 'Claude'; Mode = 'LlamaCpp'; Url = 'http://localhost:8080'; Root = 'http://localhost:8080'; Model = '../models/coder-Q4_K_M.gguf' }
+        @{ Client = 'Copilot'; Mode = 'LlamaCpp'; Url = 'http://localhost:8080/v1/'; Root = 'http://localhost:8080'; Model = '../models/coder-Q4_K_M.gguf' }
+        @{ Client = 'Claude'; Mode = 'llama.cpp'; Url = 'https://example.test:8443/llama/v1/'; Root = 'https://example.test:8443/llama'; Model = 'local-coder' }
+        @{ Client = 'Copilot'; Mode = 'llama.cpp'; Url = 'http://192.168.1.179:1234/'; Root = 'http://192.168.1.179:1234'; Model = 'local-coder' }
+    ) {
+        param($Client, $Mode, $Url, $Root, $Model)
+        $global:ModelLauncherTestState.Response = @{
+            object = 'list'
+            data = @(@{ id = $Model; object = 'model'; owned_by = 'llamacpp'; meta = $null })
+        }
+        & $launcherPath -Client $Client -ServerType $Mode -BaseUrl $Url -ClaudeAuthToken 'llama-test-key'
+        $global:ModelLauncherTestState.Request.Uri | Should Be "$Root/v1/models"
+        $global:ModelLauncherTestState.Request.Headers.Authorization | Should Be 'Bearer llama-test-key'
+        Assert-MockCalled Invoke-RestMethod -Times 1 -Exactly -Scope It
+        if ($Client -eq 'Claude') {
+            $global:ModelLauncherTestLaunch.Arguments[1] | Should Be $Model
+            $global:ModelLauncherTestLaunch.Environment.ANTHROPIC_BASE_URL | Should Be $Root
+            $global:ModelLauncherTestLaunch.Environment.ANTHROPIC_AUTH_TOKEN | Should Be 'llama-test-key'
+            $global:ModelLauncherTestLaunch.Environment.ANTHROPIC_DEFAULT_SONNET_MODEL | Should Be $Model
+        } else {
+            $global:ModelLauncherTestLaunch.Model | Should Be $Model
+            $global:ModelLauncherTestLaunch.Url | Should Be "$Root/v1"
+        }
+        foreach ($name in $environmentNames) {
+            [Environment]::GetEnvironmentVariable($name, 'Process') | Should Be 'previous-value'
+        }
+    }
+
+    It 'defaults both llama.cpp spellings to port 8080 for either client' -TestCases @(
+        @{ Client = 'Claude'; Mode = 'LlamaCpp' }
+        @{ Client = 'Copilot'; Mode = 'LlamaCpp' }
+        @{ Client = 'Claude'; Mode = 'llama.cpp' }
+        @{ Client = 'Copilot'; Mode = 'llama.cpp' }
+    ) {
+        param($Client, $Mode)
+        & $launcherPath -Client $Client -ServerType $Mode -ClaudeAuthToken ''
+        $global:ModelLauncherTestState.Request.Uri | Should Be 'http://localhost:8080/v1/models'
+        $global:ModelLauncherTestLaunch | Should Not BeNullOrEmpty
+        Assert-MockCalled Invoke-RestMethod -Times 1 -Exactly -Scope It
+    }
+
+    It 'labels an explicit llama.cpp server correctly even on another backend port' -TestCases @(
+        @{ Mode = 'LlamaCpp'; Url = 'http://localhost:1234' }
+        @{ Mode = 'llama.cpp'; Url = 'http://localhost:11434' }
+    ) {
+        param($Mode, $Url)
+        & $launcherPath -ServerType $Mode -BaseUrl $Url
+        Assert-MockCalled Write-Host -Times 1 -Exactly -Scope It -ParameterFilter { $Object -eq '1. Copilot [llama.cpp]' }
+        Assert-MockCalled Write-Host -Times 1 -Exactly -Scope It -ParameterFilter { $Object -eq '2. Claude [llama.cpp]' }
+    }
+
+    It 'stops on llama.cpp discovery failure or an empty model list' -TestCases @(
+        @{ Client = 'Claude'; Failure = $true; Message = 'Failed to fetch models' }
+        @{ Client = 'Copilot'; Failure = $true; Message = 'Failed to fetch models' }
+        @{ Client = 'Claude'; Failure = $false; Message = 'No models were returned' }
+        @{ Client = 'Copilot'; Failure = $false; Message = 'No models were returned' }
+    ) {
+        param($Client, $Failure, $Message)
+        $global:ModelLauncherTestState.RequestFailure = $Failure
+        $global:ModelLauncherTestState.Response = @{ object = 'list'; data = @() }
+        { & $launcherPath -Client $Client -ServerType LlamaCpp } | Should Throw $Message
+        $global:ModelLauncherTestLaunch | Should BeNullOrEmpty
+        Assert-MockCalled Invoke-RestMethod -Times 1 -Exactly -Scope It
+        Assert-MockCalled Read-Host -Times 0 -Exactly -Scope It
     }
 }
