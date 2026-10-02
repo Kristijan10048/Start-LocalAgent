@@ -9,12 +9,21 @@ Shows a menu of available coding agents, then prompts for model selection.
 .\Start-LocalAgent.ps1 -Client Claude -BaseUrl http://localhost:1234
 
 .EXAMPLE
+.\Start-LocalAgent.ps1 -Client Claude -ServerType LlamaCpp
+Connects to a running llama.cpp server at http://localhost:8080.
+
+.EXAMPLE
+.\Start-LocalAgent.ps1 -Client Claude -Min
+Launches Claude with --bare and --exclude-dynamic-system-prompt-sections.
+
+.EXAMPLE
 .\Start-LocalAgent.ps1 -ShowVersion
 Displays the current version of the script and exits.
 
 .NOTES
 Claude Code requires an Anthropic-compatible /v1/messages endpoint, such as
-LM Studio 0.4.1 or later. An OpenAI-only server is not sufficient.
+LM Studio 0.4.1 or later or a current llama.cpp server with --jinja enabled.
+An OpenAI-only server is not sufficient.
 #>
 
 param(
@@ -33,8 +42,11 @@ param(
     [switch]$ShowVersion,
 
     # Other compatible servers manage their own model lifecycle.
-    [ValidateSet('LMStudio', 'OpenAICompatible')]
-    [string]$ServerType = 'LMStudio'
+    [ValidateSet('LMStudio', 'OpenAICompatible', 'LlamaCpp', 'llama.cpp')]
+    [string]$ServerType = 'LMStudio',
+
+    # Adds --bare and --exclude-dynamic-system-prompt-sections for Claude only.
+    [switch]$Min
 )
 
 # Single source of truth for the script version. Bump this on each release.
@@ -48,6 +60,13 @@ if ($ShowVersion) {
 if ($Help) {
     Get-Help $MyInvocation.MyCommand -Full
     exit
+}
+
+# Accept the project's spelling as an alias and use its default server port.
+# An explicit BaseUrl always takes precedence, including custom ports/proxies.
+if ($ServerType -eq 'llama.cpp') { $ServerType = 'LlamaCpp' }
+if ($ServerType -eq 'LlamaCpp' -and -not $PSBoundParameters.ContainsKey('BaseUrl')) {
+    $BaseUrl = 'http://localhost:8080/v1'
 }
 
 # -----------------------------------------------------------------------------
@@ -105,6 +124,12 @@ $ClientConfigs = [ordered]@{
             CLAUDE_CODE_SUBAGENT_MODEL        = 'MODEL_PLACEHOLDER'
             CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
             CLAUDE_CODE_ATTRIBUTION_HEADER    = '0'
+
+            # Filled from the selected model's loaded context configuration.
+            CLAUDE_CODE_MAX_CONTEXT_TOKENS = $null
+
+            # Prevents Claude from force-compressing the prompt loop
+            DISABLE_COMPACT = 1
         }
     }
 }
@@ -147,15 +172,15 @@ function Get-LMStudioModels([string]$serverUrl, [hashtable]$headers) {
         }
         return $json.models
     } catch {
-        throw "Failed to fetch models from $serverUrl/api/v1/models. Check LM Studio's server, API version, and authentication. For another server, use -ServerType OpenAICompatible. $($_.Exception.Message)"
+        throw "Failed to fetch models from $serverUrl/api/v1/models. Check LM Studio's server, API version, and authentication. For llama.cpp, use -ServerType LlamaCpp; for other servers, use -ServerType OpenAICompatible. $($_.Exception.Message)"
     }
 }
 
 # Identify a well-known local model server from its URL so the agent menu can show
-# which backend each client is pointing at. Detection is by port (LM Studio's default
-# 1234 and Ollama's default 11434), which works regardless of host or -ServerType.
-# Returns a friendly name such as 'LM Studio' / 'Ollama', or $null when unknown.
-function Get-ServerLabel([string]$baseUrl) {
+# which backend each client is pointing at. Explicit llama.cpp mode takes priority;
+# otherwise retain the port hints for LM Studio and Ollama.
+function Get-ServerLabel([string]$baseUrl, [string]$serverType) {
+    if ($serverType -eq 'LlamaCpp') { return 'llama.cpp' }
     if ([string]::IsNullOrWhiteSpace($baseUrl)) { return $null }
     try {
         $uri = [uri]$baseUrl
@@ -169,17 +194,17 @@ function Get-ServerLabel([string]$baseUrl) {
     }
 }
 
-# Load a model and return its confirmed instance ID for inference.
+# Load a model and return its confirmed instance ID and applied configuration.
 function Load-Model([string]$serverUrl, [hashtable]$headers, [string]$modelId) {
     try {
         Write-Host "Loading model: $modelId..." -ForegroundColor Cyan
-        $body = @{ model = $modelId } | ConvertTo-Json
+        $body = @{ model = $modelId; echo_load_config = $true } | ConvertTo-Json
         $json = Invoke-RestMethod -Uri "$serverUrl/api/v1/models/load" -Headers $headers -Body $body -ContentType 'application/json' -Method Post -TimeoutSec 600 -ErrorAction Stop
         if ($json.status -cne 'loaded' -or [string]::IsNullOrWhiteSpace($json.instance_id)) {
             throw 'LM Studio did not confirm a loaded model instance.'
         }
         Write-Host "Model loaded successfully." -ForegroundColor Green
-        return $json.instance_id
+        return @{ id = $json.instance_id; config = $json.load_config }
     } catch {
         throw "Failed to load model $modelId. Error: $($_.Exception.Message)"
     }
@@ -200,7 +225,7 @@ function Unload-Model([string]$serverUrl, [hashtable]$headers, [string]$instance
     }
 }
 
-# Ensure the selected language model is loaded and return its inference ID.
+# Ensure the selected language model is loaded and return its instance metadata.
 function Ensure-ModelLoaded(
     [string]$serverUrl,
     [hashtable]$headers,
@@ -224,9 +249,46 @@ function Ensure-ModelLoaded(
 
     if ($selected[0].loaded_instances.Count -gt 0) {
         Write-Host "Selected model '$selectedModel' is already loaded." -ForegroundColor Green
-        return $selected[0].loaded_instances[0].id
+        return $selected[0].loaded_instances[0]
     }
     return Load-Model -serverUrl $serverUrl -headers $headers -modelId $selectedModel
+}
+
+# Read the runtime context window, not the model's theoretical maximum.
+function Get-ModelContextTokens(
+    [string]$ServerType,
+    [string]$serverUrl,
+    [string]$selectedModel,
+    [hashtable]$headers,
+    $loadedInstance
+) {
+    if ($ServerType -eq 'OpenAICompatible') {
+        Write-Warning 'Context size detection is unavailable in OpenAICompatible mode. CLAUDE_CODE_MAX_CONTEXT_TOKENS will be unset for this launch. Use LMStudio or LlamaCpp mode for automatic detection.'
+        return $null
+    }
+
+    try {
+        if ($ServerType -eq 'LMStudio') {
+            $contextTokens = $loadedInstance.config.context_length
+        } elseif ($ServerType -eq 'LlamaCpp') {
+            # Routing by model also supports llama.cpp servers hosting multiple models.
+            $modelQuery = [uri]::EscapeDataString($selectedModel)
+            $props = Invoke-RestMethod -Uri "$serverUrl/props?model=$modelQuery" -Headers $headers -Method Get -TimeoutSec 600 -ErrorAction Stop
+            $contextTokens = $props.default_generation_settings.n_ctx
+        } else {
+            throw "Unsupported server type '$ServerType'."
+        }
+
+        $validatedTokens = 0
+        if ([string]$contextTokens -notmatch '^[0-9]+$' -or
+            -not [int]::TryParse([string]$contextTokens, [ref]$validatedTokens) -or
+            $validatedTokens -le 0) {
+            throw 'The server did not return a positive integer for the loaded context size.'
+        }
+        return $validatedTokens.ToString([Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        throw "Cannot determine the context size for '$selectedModel' on $ServerType. Check the model's loaded configuration and server API support. $($_.Exception.Message)"
+    }
 }
 
 # -----------------------------------------------------------------------------
@@ -240,14 +302,25 @@ function Invoke-Client(
     [Parameter(Mandatory=$true)] [string]$openAiBaseUrl,
     [string]$ClaudeAuthToken,
     [hashtable]$headers,
-    [string]$ServerType
+    [string]$ServerType,
+    [switch]$Min
 ) {
     $config = $ClientConfigs[$Client]
     $clientEnvironment = @{}
+    $loadedInstance = $null
 
-    # Both clients must use a confirmed instance before launching, on any host.
+    # LM Studio clients must use a confirmed instance before launching, on any host.
     if ($ServerType -eq 'LMStudio') {
-        $selectedModel = Ensure-ModelLoaded -serverUrl $serverUrl -headers $headers -selectedModel $selectedModel
+        $loadedInstance = Ensure-ModelLoaded -serverUrl $serverUrl -headers $headers -selectedModel $selectedModel
+        $selectedModel = $loadedInstance.id
+    }
+
+    $contextTokens = $null
+    if ($Client -eq 'Claude') {
+        $contextTokens = Get-ModelContextTokens -ServerType $ServerType -serverUrl $serverUrl -selectedModel $selectedModel -headers $headers -loadedInstance $loadedInstance
+        if ($null -ne $contextTokens) {
+            Write-Host "Using context window: $contextTokens tokens." -ForegroundColor Cyan
+        }
     }
 
     # Map the environment variables from configuration.
@@ -258,6 +331,7 @@ function Invoke-Client(
         if ($key -eq 'ANTHROPIC_BASE_URL') { $val = $serverUrl }
         elseif ($key -eq 'ANTHROPIC_AUTH_TOKEN') { $val = $ClaudeAuthToken }
         elseif ($key -eq 'COPILOT_PROVIDER_BASE_URL') { $val = $openAiBaseUrl }
+        elseif ($key -eq 'CLAUDE_CODE_MAX_CONTEXT_TOKENS') { $val = $contextTokens }
         # Apply the selected model to the client and its model aliases.
         if ($val -eq 'MODEL_PLACEHOLDER') { $val = $selectedModel }
 
@@ -279,7 +353,12 @@ function Invoke-Client(
         if ($Client -eq 'Claude') {
             Write-Host "Using $serverUrl/v1/messages (requires an Anthropic-compatible server)." -ForegroundColor Cyan
             # Run in this terminal so Claude Code can read input and use the current project.
-            & $command.Source --model $selectedModel
+            $claudeArguments = @()
+            if ($Min) {
+                $claudeArguments += '--bare', '--exclude-dynamic-system-prompt-sections'
+            }
+            $claudeArguments += '--model', $selectedModel
+            & $command.Source @claudeArguments
             if ($LASTEXITCODE -ne 0) {
                 throw "Claude Code exited with code $LASTEXITCODE."
             }
@@ -323,7 +402,7 @@ function Get-ClientCommand([string]$Client) {
 if (-not $PSBoundParameters.ContainsKey('Client')) {
     Write-Host "--- Select a coding agent ---" -ForegroundColor Cyan
     # Identify the backend so each agent line can show which server it points at.
-    $serverLabel = Get-ServerLabel $BaseUrl
+    $serverLabel = Get-ServerLabel -baseUrl $BaseUrl -serverType $ServerType
 
     # Show the server address once above the list so each agent line stays short.
     Write-Host "Server: $BaseUrl" -ForegroundColor DarkGray
@@ -421,4 +500,5 @@ Invoke-Client `
     -openAiBaseUrl $openAiBaseUrl `
     -ClaudeAuthToken $ClaudeAuthToken `
     -headers $headers `
-    -ServerType $ServerType
+    -ServerType $ServerType `
+    -Min:$Min

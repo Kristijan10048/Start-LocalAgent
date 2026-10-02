@@ -19,6 +19,7 @@ it loads the selected model and unloads other language models before launching.
 | Server mode | Server requirements | Model management |
 | --- | --- | --- |
 | `LMStudio` (default) | LM Studio 0.4.0+ for the native API; 0.4.1+ when using Claude Code | The launcher checks, unloads, and loads models. |
+| `LlamaCpp` (alias `llama.cpp`) | Running `llama-server`; a build with `/v1/messages` support for Claude Code | Discovery through `/v1/models`; llama.cpp manages loading and unloading. |
 | `OpenAICompatible` | `/v1/models` for discovery and the inference API required by the chosen client | The server manages loading and unloading. |
 
 Claude Code requires an **Anthropic-compatible `/v1/messages` endpoint**. An
@@ -43,10 +44,10 @@ an agent or changing loaded models.
 
 ![Local Agent Launcher showing agent and model selection](StartLocalAgent.png)
 
-**The built-in default address is `http://192.168.1.179:1234/v1`.** This is a
-specific LAN server, not an automatically detected address. Supply `-BaseUrl`
-unless that server is yours. The URL can be the server root or end in `/v1`;
-a trailing slash is accepted.
+**The default address is `http://localhost:1234/v1`, or
+`http://localhost:8080/v1` with `-ServerType LlamaCpp`.** Supply `-BaseUrl` for
+another host or port. The URL can be the server root or end in `/v1`; a trailing
+slash is accepted.
 
 To skip the agent menu:
 
@@ -58,14 +59,22 @@ To skip the agent menu:
 To use a LAN server, substitute its address for `localhost`. The server must
 accept connections from this computer.
 
+To launch Claude with `--bare --exclude-dynamic-system-prompt-sections` and the
+selected model:
+
+```powershell
+.\Start-LocalAgent.ps1 -Client Claude -Min
+```
+
 ## Parameters
 
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `-Client` | Interactive menu | `Copilot` or `Claude`. Skips the agent menu; model selection remains interactive. |
-| `-BaseUrl` | `http://192.168.1.179:1234/v1` | HTTP(S) server root or URL ending in `/v1`. Do not include credentials, a query, or a fragment. |
-| `-ServerType` | `LMStudio` | `LMStudio` or `OpenAICompatible`. Set this explicitly for servers other than LM Studio. |
+| `-BaseUrl` | `http://localhost:1234/v1` (`http://localhost:8080/v1` for llama.cpp) | HTTP(S) server root or URL ending in `/v1`. An explicit URL overrides the server-mode default. Do not include credentials, a query, or a fragment. |
+| `-ServerType` | `LMStudio` | `LMStudio`, `LlamaCpp` (alias `llama.cpp`), or `OpenAICompatible`. Set this explicitly for servers other than LM Studio. |
 | `-ClaudeAuthToken` | `$env:LM_API_TOKEN` | Token for discovery and LM Studio model management for either client, and for Claude inference. See authentication below. |
+| `-Min` | Off | Adds `--bare --exclude-dynamic-system-prompt-sections` to the Claude launch alongside `--model`. Has no effect for Copilot. |
 | `-ShowVersion` | Off | Prints `Local Agent Launcher version 0.1` and exits without contacting the server. |
 | `-Help` | Off | Displays script help and exits without contacting the server. |
 
@@ -134,6 +143,25 @@ and default subagent model, clears conflicting provider environment variables,
 and disables nonessential Claude network traffic. It restores the previous
 process environment when Claude exits and does not edit Claude settings files.
 
+After model selection, the launcher sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` from
+the server's actual loaded context configuration and prints the detected size:
+
+- **LM Studio:** uses the selected instance's `config.context_length` from
+  `/api/v1/models`. When loading a new instance, it requests `echo_load_config`
+  and uses the returned `load_config.context_length`.
+- **llama.cpp:** requests `/props?model=<selected-model>` and uses
+  `default_generation_settings.n_ctx`, the per-slot context size. The model ID
+  is URL-encoded to support paths, aliases, and servers routing multiple models.
+- **OpenAICompatible:** warns and leaves the variable unset for that launch,
+  because this API has no standard field for the loaded context size. An
+  inherited value is temporarily cleared to avoid using another model's limit.
+
+LM Studio and llama.cpp launches of Claude stop if the context size is missing,
+invalid, or cannot be fetched. The launcher does not substitute the model's
+theoretical maximum or change the server's context allocation. Copilot does not
+require context detection. `DISABLE_COMPACT = 1` remains enabled for Claude,
+disabling automatic and manual compaction independently of the detected size.
+
 Use `/status` in Claude Code to inspect the connection. Settings files and explicit
 model overrides in custom agents can still affect which provider or model is used.
 Claude Code is the client; this launcher does not provide Anthropic's proprietary
@@ -155,6 +183,33 @@ inherits these settings; the caller's previous environment is then restored:
 Support for these settings depends on your Copilot installation. The launcher
 does not enforce network isolation.
 
+## llama.cpp
+
+Start `llama-server` with a coding model and tool calling enabled, for example:
+
+```powershell
+llama-server -m C:\models\coder.gguf --alias local-coder --jinja --port 8080
+```
+
+Replace the example model path with your GGUF file. Then launch either client:
+
+```powershell
+.\Start-LocalAgent.ps1 -Client Claude -ServerType LlamaCpp
+.\Start-LocalAgent.ps1 -Client Copilot -ServerType llama.cpp
+```
+
+Use `-BaseUrl http://your-server:8080` for a remote server or custom address.
+Both spellings use `/v1/models` for discovery, preserve the advertised model ID
+(file path or alias), and skip LM Studio's management API. `OpenAICompatible`
+also works with llama.cpp when its address is supplied explicitly.
+
+Claude needs a llama.cpp build that implements `/v1/messages`; tool use requires
+`--jinja` and a suitable model/chat template. See the
+[llama.cpp server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md).
+For a server started with `--api-key`, pass the same key through
+`-ClaudeAuthToken` for discovery and Claude inference. Copilot authentication
+still needs separate configuration as described above.
+
 ## Other compatible servers
 
 Use `-ServerType OpenAICompatible` to discover models through `/v1/models` without
@@ -174,10 +229,11 @@ for server setup. Changing `-BaseUrl` alone does not change the server type.
 | Symptom | What to check |
 | --- | --- |
 | Client not found | Install the selected client, open a new terminal, and check that `claude` or `copilot.exe` is on `PATH`. |
-| Failed to fetch models | Check `-BaseUrl`, server status, network access, and authentication. For a different server, pass `-ServerType OpenAICompatible`. |
+| Failed to fetch models | Check `-BaseUrl`, server status, network access, and authentication. For llama.cpp, pass `-ServerType LlamaCpp`; for other compatible servers, use `-ServerType OpenAICompatible`. |
 | No models returned | Download a language model in LM Studio. In compatible mode, make a suitable model available through the server's `/v1/models` endpoint. |
 | Selected model no longer available | The server's model list changed while the menu was open. Run the launcher and select again. |
 | Failed to unload or load | Check the server logs, token permissions, and available memory. Resolve the error before retrying. |
+| Cannot determine the context size | Check the selected instance's context configuration and server API support. LM Studio must return `config.context_length` or echoed `load_config.context_length`; llama.cpp must expose `default_generation_settings.n_ctx` through `/props`. |
 | Claude uses an unexpected provider or model | Check `/status`, Claude settings files, and custom agent model overrides. |
 
 ## Validation
@@ -192,10 +248,13 @@ Invoke-Pester .\Start-LocalAgent.Tests.ps1
 The version 0.1 checks cover menus, URL handling, environment restoration, model
 reuse and switching, instance IDs, and failures that must prevent launch. They use
 simulated servers and clients, so they do not load real models or start coding
-sessions. The current suite has **56 passing tests** with Pester 3.4.0 on PowerShell
-7 and Windows PowerShell 5.1.
+sessions. llama.cpp checks also cover both server-type spellings, default and
+custom addresses, model paths and aliases, authentication forwarding, and
+discovery failures. Context checks cover loaded and newly loaded instances,
+selection-specific limits, llama.cpp per-slot sizes, invalid or missing values,
+and environment restoration.
 
-Live end-to-end validation with LM Studio, Copilot, and Claude Code is still
+Live end-to-end validation with LM Studio, llama.cpp, Copilot, and Claude Code is still
 outstanding; automated test results do not establish compatibility with every
 client version or model.
 
