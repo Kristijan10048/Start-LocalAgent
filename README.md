@@ -59,6 +59,13 @@ To skip the agent menu:
 To use a LAN server, substitute its address for `localhost`. The server must
 accept connections from this computer.
 
+To launch Claude with `--bare --exclude-dynamic-system-prompt-sections` and the
+selected model:
+
+```powershell
+.\Start-LocalAgent.ps1 -Client Claude -Min
+```
+
 ## Parameters
 
 | Parameter | Default | Description |
@@ -67,6 +74,7 @@ accept connections from this computer.
 | `-BaseUrl` | `http://localhost:1234/v1` (`http://localhost:8080/v1` for llama.cpp) | HTTP(S) server root or URL ending in `/v1`. An explicit URL overrides the server-mode default. Do not include credentials, a query, or a fragment. |
 | `-ServerType` | `LMStudio` | `LMStudio`, `LlamaCpp` (alias `llama.cpp`), or `OpenAICompatible`. Set this explicitly for servers other than LM Studio. |
 | `-ClaudeAuthToken` | `$env:LM_API_TOKEN` | Token for discovery and LM Studio model management for either client, and for Claude inference. See authentication below. |
+| `-Min` | Off | Adds `--bare --exclude-dynamic-system-prompt-sections` to the Claude launch alongside `--model`. Has no effect for Copilot. |
 | `-ShowVersion` | Off | Prints `Local Agent Launcher version 0.1` and exits without contacting the server. |
 | `-Help` | Off | Displays script help and exits without contacting the server. |
 

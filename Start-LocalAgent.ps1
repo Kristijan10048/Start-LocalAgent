@@ -13,6 +13,10 @@ Shows a menu of available coding agents, then prompts for model selection.
 Connects to a running llama.cpp server at http://localhost:8080.
 
 .EXAMPLE
+.\Start-LocalAgent.ps1 -Client Claude -Min
+Launches Claude with --bare and --exclude-dynamic-system-prompt-sections.
+
+.EXAMPLE
 .\Start-LocalAgent.ps1 -ShowVersion
 Displays the current version of the script and exits.
 
@@ -39,7 +43,10 @@ param(
 
     # Other compatible servers manage their own model lifecycle.
     [ValidateSet('LMStudio', 'OpenAICompatible', 'LlamaCpp', 'llama.cpp')]
-    [string]$ServerType = 'LMStudio'
+    [string]$ServerType = 'LMStudio',
+
+    # Adds --bare and --exclude-dynamic-system-prompt-sections for Claude only.
+    [switch]$Min
 )
 
 # Single source of truth for the script version. Bump this on each release.
@@ -295,7 +302,8 @@ function Invoke-Client(
     [Parameter(Mandatory=$true)] [string]$openAiBaseUrl,
     [string]$ClaudeAuthToken,
     [hashtable]$headers,
-    [string]$ServerType
+    [string]$ServerType,
+    [switch]$Min
 ) {
     $config = $ClientConfigs[$Client]
     $clientEnvironment = @{}
@@ -345,7 +353,12 @@ function Invoke-Client(
         if ($Client -eq 'Claude') {
             Write-Host "Using $serverUrl/v1/messages (requires an Anthropic-compatible server)." -ForegroundColor Cyan
             # Run in this terminal so Claude Code can read input and use the current project.
-            & $command.Source --model $selectedModel
+            $claudeArguments = @()
+            if ($Min) {
+                $claudeArguments += '--bare', '--exclude-dynamic-system-prompt-sections'
+            }
+            $claudeArguments += '--model', $selectedModel
+            & $command.Source @claudeArguments
             if ($LASTEXITCODE -ne 0) {
                 throw "Claude Code exited with code $LASTEXITCODE."
             }
@@ -487,4 +500,5 @@ Invoke-Client `
     -openAiBaseUrl $openAiBaseUrl `
     -ClaudeAuthToken $ClaudeAuthToken `
     -headers $headers `
-    -ServerType $ServerType
+    -ServerType $ServerType `
+    -Min:$Min
