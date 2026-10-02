@@ -135,6 +135,25 @@ and default subagent model, clears conflicting provider environment variables,
 and disables nonessential Claude network traffic. It restores the previous
 process environment when Claude exits and does not edit Claude settings files.
 
+After model selection, the launcher sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` from
+the server's actual loaded context configuration and prints the detected size:
+
+- **LM Studio:** uses the selected instance's `config.context_length` from
+  `/api/v1/models`. When loading a new instance, it requests `echo_load_config`
+  and uses the returned `load_config.context_length`.
+- **llama.cpp:** requests `/props?model=<selected-model>` and uses
+  `default_generation_settings.n_ctx`, the per-slot context size. The model ID
+  is URL-encoded to support paths, aliases, and servers routing multiple models.
+- **OpenAICompatible:** warns and leaves the variable unset for that launch,
+  because this API has no standard field for the loaded context size. An
+  inherited value is temporarily cleared to avoid using another model's limit.
+
+LM Studio and llama.cpp launches of Claude stop if the context size is missing,
+invalid, or cannot be fetched. The launcher does not substitute the model's
+theoretical maximum or change the server's context allocation. Copilot does not
+require context detection. `DISABLE_COMPACT = 1` remains enabled for Claude,
+disabling automatic and manual compaction independently of the detected size.
+
 Use `/status` in Claude Code to inspect the connection. Settings files and explicit
 model overrides in custom agents can still affect which provider or model is used.
 Claude Code is the client; this launcher does not provide Anthropic's proprietary
@@ -206,6 +225,7 @@ for server setup. Changing `-BaseUrl` alone does not change the server type.
 | No models returned | Download a language model in LM Studio. In compatible mode, make a suitable model available through the server's `/v1/models` endpoint. |
 | Selected model no longer available | The server's model list changed while the menu was open. Run the launcher and select again. |
 | Failed to unload or load | Check the server logs, token permissions, and available memory. Resolve the error before retrying. |
+| Cannot determine the context size | Check the selected instance's context configuration and server API support. LM Studio must return `config.context_length` or echoed `load_config.context_length`; llama.cpp must expose `default_generation_settings.n_ctx` through `/props`. |
 | Claude uses an unexpected provider or model | Check `/status`, Claude settings files, and custom agent model overrides. |
 
 ## Validation
@@ -222,7 +242,9 @@ reuse and switching, instance IDs, and failures that must prevent launch. They u
 simulated servers and clients, so they do not load real models or start coding
 sessions. llama.cpp checks also cover both server-type spellings, default and
 custom addresses, model paths and aliases, authentication forwarding, and
-discovery failures.
+discovery failures. Context checks cover loaded and newly loaded instances,
+selection-specific limits, llama.cpp per-slot sizes, invalid or missing values,
+and environment restoration.
 
 Live end-to-end validation with LM Studio, llama.cpp, Copilot, and Claude Code is still
 outstanding; automated test results do not establish compatibility with every

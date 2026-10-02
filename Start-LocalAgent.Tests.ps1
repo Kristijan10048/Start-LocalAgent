@@ -2,7 +2,7 @@ $launcherPath = Join-Path $PSScriptRoot 'Start-LocalAgent.ps1'
 
 Describe 'Local Agent Launcher' {
     function New-TestModel([string]$Key, [string[]]$Instances = @(), [string]$Type = 'llm') {
-        @{ key = $Key; type = $Type; loaded_instances = @($Instances | ForEach-Object { @{ id = $_ } }) }
+        @{ key = $Key; type = $Type; max_context_length = 131072; loaded_instances = @($Instances | ForEach-Object { @{ id = $_; config = @{ context_length = 32768 } } }) }
     }
     # Exercise the real launcher without starting a client or contacting a server.
     $stubPath = Join-Path $TestDrive 'claude.ps1'
@@ -28,6 +28,7 @@ exit $global:ModelLauncherTestExitCode
         'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_FABLE_MODEL',
         'ANTHROPIC_SMALL_FAST_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL',
         'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'CLAUDE_CODE_ATTRIBUTION_HEADER',
+        'CLAUDE_CODE_MAX_CONTEXT_TOKENS', 'DISABLE_COMPACT',
         'COPILOT_PROVIDER_BASE_URL', 'COPILOT_PROVIDER_TYPE', 'COPILOT_MODEL', 'COPILOT_OFFLINE'
     )
 
@@ -39,6 +40,7 @@ exit $global:ModelLauncherTestExitCode
         }
         $global:ModelLauncherTestState = @{ Command = $stubCommand }
         $global:ModelLauncherTestState.Response = @{ data = @(@{ id = 'qwen/local-coder' }) }
+        $global:ModelLauncherTestState.PropsResponse = @{ default_generation_settings = @{ n_ctx = 65536 }; total_slots = 4 }
         $global:ModelLauncherTestState.NativeResponse = @{ models = @(New-TestModel 'qwen/local-coder' @('qwen/local-coder')) }
         $global:ModelLauncherTestState.Requests = New-Object System.Collections.ArrayList
         $global:ModelLauncherTestState.ListCount = 0
@@ -66,7 +68,7 @@ exit $global:ModelLauncherTestExitCode
             if ($Uri -like '*/api/v1/models/load') {
                 if ($state.LoadFailure) { throw 'Simulated load failure' }
                 if ($state.ContainsKey('LoadResponse')) { return $state.LoadResponse }
-                return @{ status = 'loaded'; instance_id = ($Body | ConvertFrom-Json).model }
+                return @{ status = 'loaded'; instance_id = ($Body | ConvertFrom-Json).model; load_config = @{ context_length = 16384 } }
             }
             if ($Uri -like '*/api/v1/models/unload') {
                 if ($state.UnloadFailure) { throw 'Simulated unload failure' }
@@ -74,6 +76,10 @@ exit $global:ModelLauncherTestExitCode
                 return @{ instance_id = ($Body | ConvertFrom-Json).instance_id }
             }
             if ($Uri -like '*/v1/models') { return $state.Response }
+            if ($Uri -like '*/props?model=*') {
+                if ($state.PropsFailure) { throw 'Simulated props failure' }
+                return $state.PropsResponse
+            }
             throw "Unexpected endpoint: $Uri"
         }
         Mock Read-Host {
@@ -84,6 +90,7 @@ exit $global:ModelLauncherTestExitCode
             }
         }
         Mock Write-Host {}
+        Mock Write-Warning {}
         Mock Start-Process {
             $global:ModelLauncherTestLaunch = @{
                 Url = $env:COPILOT_PROVIDER_BASE_URL
@@ -121,6 +128,8 @@ exit $global:ModelLauncherTestExitCode
         $launch.Environment.CLAUDE_CODE_USE_MANTLE | Should BeNullOrEmpty
         $launch.Environment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC | Should Be '1'
         $launch.Environment.CLAUDE_CODE_ATTRIBUTION_HEADER | Should Be '0'
+        $launch.Environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS | Should Be '32768'
+        $launch.Environment.DISABLE_COMPACT | Should Be '1'
         foreach ($name in @('ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
                 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
                 'ANTHROPIC_DEFAULT_FABLE_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL')) {
@@ -307,7 +316,7 @@ exit $global:ModelLauncherTestExitCode
     ) {
         param($Client, $Root)
         $global:ModelLauncherTestState.NativeResponse = '{"models":[{"key":"qwen/local-coder","type":"llm","loaded_instances":[]}]}' | ConvertFrom-Json
-        $global:ModelLauncherTestState.LoadResponse = @{ status = 'loaded'; instance_id = 'custom-loaded-id' }
+        $global:ModelLauncherTestState.LoadResponse = @{ status = 'loaded'; instance_id = 'custom-loaded-id'; load_config = @{ context_length = 49152 } }
         & $launcherPath -Client $Client -BaseUrl "$Root/v1/" -ClaudeAuthToken 'test-token'
         $requests = $global:ModelLauncherTestState.Requests
         $requests.Count | Should Be 3
@@ -317,11 +326,13 @@ exit $global:ModelLauncherTestExitCode
         $requests[2].Method | Should Be 'Post'
         $requests[2].ContentType | Should Be 'application/json'
         ($requests[2].Body | ConvertFrom-Json).model | Should Be 'qwen/local-coder'
+        ($requests[2].Body | ConvertFrom-Json).echo_load_config | Should Be $true
         $requests[2].TimeoutSec | Should BeGreaterThan 60
         foreach ($request in $requests) { $request.Headers.Authorization | Should Be 'Bearer test-token' }
         if ($Client -eq 'Claude') {
             $global:ModelLauncherTestLaunch.Arguments[1] | Should Be 'custom-loaded-id'
             $global:ModelLauncherTestLaunch.Environment.ANTHROPIC_MODEL | Should Be 'custom-loaded-id'
+            $global:ModelLauncherTestLaunch.Environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS | Should Be '49152'
         } else {
             $global:ModelLauncherTestLaunch.Model | Should Be 'custom-loaded-id'
         }
@@ -340,9 +351,10 @@ exit $global:ModelLauncherTestExitCode
 
     # Confirms that if the selected model already has a loaded instance, its instance ID is reused with no load/unload requests issued.
     It 'reuses an already loaded selection without loading or unloading it' {
-        $global:ModelLauncherTestState.NativeResponse = '{"models":[{"key":"qwen/local-coder","type":"llm","loaded_instances":[{"id":"my-coder"}]}]}' | ConvertFrom-Json
+        $global:ModelLauncherTestState.NativeResponse = '{"models":[{"key":"qwen/local-coder","type":"llm","loaded_instances":[{"id":"my-coder","config":{"context_length":24576}}]}]}' | ConvertFrom-Json
         & $launcherPath -Client Claude
         $global:ModelLauncherTestLaunch.Arguments[1] | Should Be 'my-coder'
+        $global:ModelLauncherTestLaunch.Environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS | Should Be '24576'
         Assert-MockCalled Invoke-RestMethod -Times 0 -Exactly -Scope It -ParameterFilter { $Method -eq 'Post' }
     }
 
@@ -397,8 +409,10 @@ exit $global:ModelLauncherTestExitCode
     It 'refreshes model state after the menu before deciding to load' {
         $global:ModelLauncherTestState.NativeResponse = @{ models = @(New-TestModel 'qwen/local-coder') }
         $global:ModelLauncherTestState.RefreshResponse = @{ models = @(New-TestModel 'qwen/local-coder' @('recently-loaded')) }
+        $global:ModelLauncherTestState.RefreshResponse.models[0].loaded_instances[0].config.context_length = 57344
         & $launcherPath -Client Claude
         $global:ModelLauncherTestLaunch.Arguments[1] | Should Be 'recently-loaded'
+        $global:ModelLauncherTestLaunch.Environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS | Should Be '57344'
         Assert-MockCalled Invoke-RestMethod -Times 0 -Exactly -Scope It -ParameterFilter { $Method -eq 'Post' }
     }
 
@@ -481,6 +495,11 @@ exit $global:ModelLauncherTestExitCode
         $global:ModelLauncherTestState.Request.Uri | Should Be 'http://localhost:11434/v1/models'
         $global:ModelLauncherTestLaunch | Should Not BeNullOrEmpty
         Assert-MockCalled Invoke-RestMethod -Times 1 -Exactly -Scope It
+        if ($Client -eq 'Claude') {
+            $global:ModelLauncherTestLaunch.Environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS | Should BeNullOrEmpty
+            $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS | Should Be 'previous-value'
+            Assert-MockCalled Write-Warning -Times 1 -Exactly -Scope It -ParameterFilter { $Message -like '*Context size detection is unavailable*' }
+        }
     }
 
     It 'uses llama.cpp discovery and preserves model IDs for both clients' -TestCases @(
@@ -495,15 +514,20 @@ exit $global:ModelLauncherTestExitCode
             data = @(@{ id = $Model; object = 'model'; owned_by = 'llamacpp'; meta = $null })
         }
         & $launcherPath -Client $Client -ServerType $Mode -BaseUrl $Url -ClaudeAuthToken 'llama-test-key'
-        $global:ModelLauncherTestState.Request.Uri | Should Be "$Root/v1/models"
-        $global:ModelLauncherTestState.Request.Headers.Authorization | Should Be 'Bearer llama-test-key'
-        Assert-MockCalled Invoke-RestMethod -Times 1 -Exactly -Scope It
+        $global:ModelLauncherTestState.Requests[0].Uri | Should Be "$Root/v1/models"
+        foreach ($request in $global:ModelLauncherTestState.Requests) {
+            $request.Headers.Authorization | Should Be 'Bearer llama-test-key'
+        }
         if ($Client -eq 'Claude') {
+            Assert-MockCalled Invoke-RestMethod -Times 2 -Exactly -Scope It
+            ([uri]$global:ModelLauncherTestState.Requests[1].Uri).AbsoluteUri | Should Be "$Root/props?model=$([uri]::EscapeDataString($Model))"
+            $global:ModelLauncherTestLaunch.Environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS | Should Be '65536'
             $global:ModelLauncherTestLaunch.Arguments[1] | Should Be $Model
             $global:ModelLauncherTestLaunch.Environment.ANTHROPIC_BASE_URL | Should Be $Root
             $global:ModelLauncherTestLaunch.Environment.ANTHROPIC_AUTH_TOKEN | Should Be 'llama-test-key'
             $global:ModelLauncherTestLaunch.Environment.ANTHROPIC_DEFAULT_SONNET_MODEL | Should Be $Model
         } else {
+            Assert-MockCalled Invoke-RestMethod -Times 1 -Exactly -Scope It
             $global:ModelLauncherTestLaunch.Model | Should Be $Model
             $global:ModelLauncherTestLaunch.Url | Should Be "$Root/v1"
         }
@@ -520,9 +544,13 @@ exit $global:ModelLauncherTestExitCode
     ) {
         param($Client, $Mode)
         & $launcherPath -Client $Client -ServerType $Mode -ClaudeAuthToken ''
-        $global:ModelLauncherTestState.Request.Uri | Should Be 'http://localhost:8080/v1/models'
+        $global:ModelLauncherTestState.Requests[0].Uri | Should Be 'http://localhost:8080/v1/models'
         $global:ModelLauncherTestLaunch | Should Not BeNullOrEmpty
-        Assert-MockCalled Invoke-RestMethod -Times 1 -Exactly -Scope It
+        if ($Client -eq 'Claude') {
+            Assert-MockCalled Invoke-RestMethod -Times 2 -Exactly -Scope It
+        } else {
+            Assert-MockCalled Invoke-RestMethod -Times 1 -Exactly -Scope It
+        }
     }
 
     It 'labels an explicit llama.cpp server correctly even on another backend port' -TestCases @(
@@ -548,5 +576,58 @@ exit $global:ModelLauncherTestExitCode
         $global:ModelLauncherTestLaunch | Should BeNullOrEmpty
         Assert-MockCalled Invoke-RestMethod -Times 1 -Exactly -Scope It
         Assert-MockCalled Read-Host -Times 0 -Exactly -Scope It
+    }
+
+    It 'uses the selected LM Studio instance context rather than another instance or model maximum' {
+        $first = New-TestModel 'first-model' @('first-instance')
+        $second = New-TestModel 'second-model' @('selected-instance', 'other-instance')
+        $second.loaded_instances[0].config.context_length = 49152
+        $second.loaded_instances[1].config.context_length = 98304
+        $global:ModelLauncherTestState.NativeResponse = @{ models = @($first, $second) }
+        $global:ModelLauncherTestState.Selection = '2'
+        & $launcherPath -Client Claude
+        $global:ModelLauncherTestLaunch.Arguments[1] | Should Be 'selected-instance'
+        $global:ModelLauncherTestLaunch.Environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS | Should Be '49152'
+    }
+
+    It 'rejects missing or invalid runtime context instead of inheriting a stale limit' -TestCases @(
+        @{ Mode = 'LMStudio'; Value = $null }
+        @{ Mode = 'LMStudio'; Value = 0 }
+        @{ Mode = 'LMStudio'; Value = -1 }
+        @{ Mode = 'LMStudio'; Value = 123.5 }
+        @{ Mode = 'LMStudio'; Value = 'unknown' }
+        @{ Mode = 'LlamaCpp'; Value = $null }
+        @{ Mode = 'LlamaCpp'; Value = 0 }
+        @{ Mode = 'LlamaCpp'; Value = -1 }
+        @{ Mode = 'LlamaCpp'; Value = '999999999999999' }
+    ) {
+        param($Mode, $Value)
+        $global:ModelLauncherTestState.NativeResponse.models[0].loaded_instances[0].config.context_length = $Value
+        $global:ModelLauncherTestState.PropsResponse.default_generation_settings.n_ctx = $Value
+        { & $launcherPath -Client Claude -ServerType $Mode } | Should Throw 'Cannot determine the context size'
+        $global:ModelLauncherTestLaunch | Should BeNullOrEmpty
+        $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS | Should Be 'previous-value'
+    }
+
+    It 'stops if a newly loaded LM Studio model omits its applied context size' {
+        $global:ModelLauncherTestState.NativeResponse = @{ models = @(New-TestModel 'qwen/local-coder') }
+        $global:ModelLauncherTestState.LoadResponse = @{ status = 'loaded'; instance_id = 'custom-loaded-id' }
+        { & $launcherPath -Client Claude } | Should Throw 'Cannot determine the context size'
+        $global:ModelLauncherTestLaunch | Should BeNullOrEmpty
+    }
+
+    It 'stops when llama.cpp context lookup fails' {
+        $global:ModelLauncherTestState.PropsFailure = $true
+        { & $launcherPath -Client Claude -ServerType LlamaCpp } | Should Throw 'Simulated props failure'
+        $global:ModelLauncherTestLaunch | Should BeNullOrEmpty
+        $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS | Should Be 'previous-value'
+    }
+
+    It 'restores an unset context variable after Claude launch failure' {
+        [Environment]::SetEnvironmentVariable('CLAUDE_CODE_MAX_CONTEXT_TOKENS', $null, 'Process')
+        $global:ModelLauncherTestThrow = $true
+        { & $launcherPath -Client Claude } | Should Throw 'Simulated launch failure'
+        $global:ModelLauncherTestLaunch.Environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS | Should Be '32768'
+        $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS | Should BeNullOrEmpty
     }
 }
